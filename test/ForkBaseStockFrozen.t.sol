@@ -7,6 +7,47 @@ interface IERC20Balance {
     function balanceOf(address) external view returns (uint256);
 }
 
+interface IERC20Full {
+    function transfer(address, uint256) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
+}
+
+interface IMetricOmmSwapCallback {
+    function metricOmmSwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata callbackData) external;
+}
+
+interface IPoolSwap {
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int128 amountSpecified,
+        uint128 priceLimitX64,
+        bytes calldata callbackData,
+        bytes calldata extensionData
+    ) external returns (int128 amount0Delta, int128 amount1Delta);
+}
+
+/// @dev Minimal swapper: pays whatever the pool is owed in the callback (transfer from own balance).
+contract MockSwapper is IMetricOmmSwapCallback {
+    address internal immutable token0;
+    address internal immutable token1;
+
+    constructor(address _token0, address _token1) {
+        token0 = _token0;
+        token1 = _token1;
+    }
+
+    function metricOmmSwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        if (amount0Delta > 0) IERC20Full(token0).transfer(msg.sender, uint256(amount0Delta));
+        if (amount1Delta > 0) IERC20Full(token1).transfer(msg.sender, uint256(amount1Delta));
+    }
+
+    /// @dev Entry point: the pool calls the swap callback on msg.sender, so the swapper starts the swap itself.
+    function doSwap(address pool, int128 amountIn) external returns (int128 d0, int128 d1) {
+        return IPoolSwap(pool).swap(address(this), false, amountIn, uint128(uint256(400) << 64), "", "");
+    }
+}
+
 /// @dev The live B20 token is EOF bytecode (0xEF-prefixed); forge's fork EVM at evm_version cancun
 ///      cannot execute it (OpcodeNotFound). This mock mirrors the values the issuer registry reads
 ///      from the real token (multiplier 1e18, no pending schedule), so the test can etch it in.
@@ -38,6 +79,19 @@ contract MockB20Token {
     // mirrors the live AAPLc balance of pool 133 at fork time
     function balanceOf(address) external pure returns (uint256) {
         return 8907275567;
+    }
+
+    // ERC20 surface the pool touches during a swap (balance checks are on the USDC side only)
+    function transfer(address, uint256) external pure returns (bool) {
+        return true;
+    }
+
+    function transferFrom(address, address, uint256) external pure returns (bool) {
+        return true;
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        return true;
     }
 }
 
@@ -127,6 +181,7 @@ contract ForkBaseStockFrozen is Test {
     // feed timestamp in place revives the pool -> the freeze is feed-timestamp staleness.
     // ─────────────────────────────────────────────────────────────────────────
     address constant AAPLC_G = 0xb200000000000000000000C2e324d24d7eEcd1fb;
+    address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address constant POOL133 = 0x749f424a5A14aaD0d51CBb38Eba57f690d71BA19;
     address constant PYTH_ORACLE = 0x30a88bf894D1b806125a23ebf23D715496fD7102;
     address constant AAPLC = 0xb200000000000000000000C2e324d24d7eEcd1fb;
@@ -172,17 +227,7 @@ contract ForkBaseStockFrozen is Test {
         // the gate routes pool133 through 0xB565.. -> compressed feed creator..slot80 pos0; the live
         // pushed spread index 0xcb decodes to 203 (2.03 bps) which trips a gate-side spread bound.
         // Normalize the spread bytes (keep price & ts) to verify the pipeline is otherwise complete.
-        bytes32 s80 = 0x8dfdc825dd0453e7c80b1c1d32ae910e35d6efe9000000000000000000000050;
-        bytes32 w80 = vm.load(COMPRESSED_ORACLE, s80);
-        uint256 d0 = (uint256(w80) >> 208) & ((1 << 48) - 1);
-        uint256 p80 = d0 >> 16;
-        uint256 d0new = (p80 << 16) | (0x4f << 8) | 0x4f; // spread 198 (< 2 bps)
-        uint256 ts80 = block.timestamp * 1000; // pin the slot ts to the fork clock
-        vm.store(
-            COMPRESSED_ORACLE,
-            s80,
-            bytes32(((uint256(w80) & ((1 << 208) - 1)) & ~(X56 << 8)) | (d0new << 208) | (ts80 << 8))
-        );
+        _pinSlot80();
 
         (bool ok1, uint128 bid, uint128 ask, bytes memory err1) = _poolQuote133();
         emit log_named_bytes("err", err1);
@@ -192,6 +237,62 @@ contract ForkBaseStockFrozen is Test {
         emit log_named_uint("pool133 bid (Q64)", bid);
         // feed mid was 357.36643000 ($357.37), quotes slightly wider
         assertApproxEqRel(uint256(bid), uint256(357) << 64, 0.05e18);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Part 3: END-TO-END SWAP. After the same revival patches, an external swapper
+    // executes a real pool.swap(): give 1 USDC, receive AAPLc, settle via callback.
+    // ─────────────────────────────────────────────────────────────────────────
+    function test_funded_pool133_end_to_end_swap_after_revival() public {
+        vm.etch(AAPLC_G, type(MockB20Token).runtimeCode);
+
+        // revive feeds (both Pyth legs) + unpause the gate + pin slot-80 ts
+        bytes32 w = vm.load(PYTH_ORACLE, PYTH_FEED_SLOT);
+        vm.store(
+            PYTH_ORACLE, PYTH_FEED_SLOT, bytes32((uint256(w) & ((1 << 96) - 1)) | ((block.timestamp * 1000) << 96))
+        );
+        bytes32 u = vm.load(PYTH_ORACLE, PYTH_USDC_SLOT);
+        vm.store(
+            PYTH_ORACLE, PYTH_USDC_SLOT, bytes32((uint256(u) & ((1 << 96) - 1)) | ((block.timestamp * 1000) << 96))
+        );
+        bytes32 cfg = vm.load(TRADING_GATE, GATE_CONFIG_SLOT);
+        vm.store(TRADING_GATE, GATE_CONFIG_SLOT, bytes32(uint256(cfg) & ~(uint256(1) << 224)));
+        _pinSlot80();
+
+        // fund a swapper with 1,000 USDC and run the swap: exact input 1 USDC -> token0 out
+        MockSwapper sw = new MockSwapper(AAPLC_G, USDC);
+        deal(USDC, address(sw), 1_000e6);
+        uint256 poolUsdcBefore = IERC20Full(USDC).balanceOf(POOL133);
+
+        (int128 d0, int128 d1) = sw.doSwap(POOL133, int128(1_000_000));
+
+        emit log_named_int("amount0Delta (AAPLc, negative = paid out)", d0);
+        emit log_named_int("amount1Delta (USDC, positive = pool received)", d1);
+
+        assertGt(d1, 0, "pool must receive USDC");
+        assertLt(d0, 0, "swapper must receive AAPLc");
+        uint256 out = uint256(int256(-d0));
+        // ~1 / 357 = 0.0028 AAPLc for 1 USDC -> between 0.0001 and 0.01 AAPLc
+        assertGt(out, 1e8 / 10_000);
+        assertLt(out, 1e8 / 100);
+        assertGe(IERC20Full(USDC).balanceOf(POOL133), poolUsdcBefore + uint256(int256(d1)), "pool USDC balance grew");
+        assertEq(IERC20Full(USDC).balanceOf(address(sw)), 1_000e6 - uint256(int256(d1)));
+    }
+
+    /// @dev Normalize feed slot 80 (the gate's route): spread bytes -> 0x4f (198, < 2 bps) and ts -> fork clock.
+    function _pinSlot80() internal {
+        bytes32 s80 = 0x8dfdc825dd0453e7c80b1c1d32ae910e35d6efe9000000000000000000000050;
+        bytes32 w80 = vm.load(COMPRESSED_ORACLE, s80);
+        uint256 d0 = (uint256(w80) >> 208) & ((1 << 48) - 1);
+        uint256 p80 = d0 >> 16;
+        uint256 d0new = (p80 << 16) | (0x4f << 8) | 0x4f;
+        vm.store(
+            COMPRESSED_ORACLE,
+            s80,
+            bytes32(
+                ((uint256(w80) & ((1 << 208) - 1)) & ~(X56 << 8)) | (d0new << 208) | ((block.timestamp * 1000) << 8)
+            )
+        );
     }
 
     function _poolQuote133() internal returns (bool ok, uint128 bid, uint128 ask, bytes memory err) {

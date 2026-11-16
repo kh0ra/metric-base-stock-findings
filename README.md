@@ -1,6 +1,6 @@
 # Metric × Base — tokenized-stock pool findings (Nov 2026)
 
-Reproducible findings for **Metric** (Base mainnet): every Base tokenized-stock pool was unbuyable at snapshot — via four independently verified mechanisms. Contains the two Immunefi-ready reports, a live-outage ops note, and a fork PoC suite that **passes**.
+Reproducible findings for **Metric** (Base mainnet): every Base tokenized-stock pool was unbuyable at snapshot — via four independently verified mechanisms. Contains the two Immunefi-ready reports, a live-outage ops note, and a fork PoC suite that **passes** — including an **end-to-end swap** (1 USDC → 0.0027987 AAPLc at $357.3) executed after reviving a funded pool on the fork.
 
 > **Snapshot:** 2026-11-16 ~14:45Z · Base block ≈58,249,5xx
 > All facts below were verified on-chain (reads, `callTracer` traces, storage slots) and with passing fork tests against live state. Push pipelines are timing-sensitive — re-run the checks if the state has moved.
@@ -12,7 +12,7 @@ Reproducible findings for **Metric** (Base mainnet): every Base tokenized-stock 
 | **F1** | **Stock feed frozen 52.06 days.** Compressed-oracle feed `creator=0x8dfdc825….efe9, slot=1` (AAPLc/METAc/GOOGLc/NVDAc) `timestampMs` untouched since **2026-09-25T13:18:38.966Z**. Consuming adapters enforce `maxTimeDelta()==10s` ⇒ every quote reverts `FeedStalled`. Pools **idx 23–30** bricked. | **High** (freezing, 100% swap failure, no on-chain recovery) | `test/ForkBaseStockFrozen.t.sol::test_slot1_ts_frozen_since_sept25_blocks_stock_pool` — patching **only** the feed ts restores quoting ($336 AAPLc) |
 | **F2** | **Live venue-wide outage.** Compressed pusher last accepted push **14:11:17Z** (block 58,239,550), Pyth stock relayer last relay **13:45:15Z**; 0 `FeedUpdated` since. With 5–10 s staleness windows, **100/134 reachable pools** revert instantly. | Ops note | log scans + storage ts |
 | **F3** | **MultiplierOracle `0x448d6711…` missing from `PythOracle` integrator whitelist** ⇒ `NotWhitelisted(0x448d6711…)` on every read of **29 pools** (idx 48–59, 61–62, 66–80). Dead since deploy. **One-tx fix:** `PythOracle.addIntegrator(0x448d6711…)` (ADMIN_ROLE on the admin Safe, verified). | **High/Medium** (freezing, trivial fix) | callTraces + `isIntegrator()` + raw repro commands |
-| **F4** | **Funded stock pools seeded and left paused.** Pools idx 133–139 hold real inventory (pool 133: 89.07 AAPLc + 9,578 USDC), `isTradingPaused==true` on gate `0x0049bce2…` (flag = bit 224 of `poolConfig[pool]`, slot `keccak(pool,3)`). Fork test shows the pipeline is otherwise complete. | Ops note (context) | `test/ForkBaseStockFrozen.t.sol::test_funded_pool133_…` (PASS after 3 surgical patches) |
+| **F4** | **Funded stock pools seeded and left paused.** Pools idx 133–139 hold real inventory (pool 133: 89.07 AAPLc + 9,578 USDC), `isTradingPaused==true` on gate `0x0049bce2…` (flag = bit 224 of `poolConfig[pool]`, slot `keccak(pool,3)`). Fork tests show the pipeline is otherwise complete — including a live **swap** of 1 USDC → 0.0027987 AAPLc. | Ops note (context) | `test/…::test_funded_pool133_end_to_end_swap_after_revival` + `…revives_when_pyth_feed_ts_refreshed` (PASS) |
 
 Reports: [`reports/01-frozen-stock-feed.md`](reports/01-frozen-stock-feed.md) · [`reports/02-missing-integrator-whitelist.md`](reports/02-missing-integrator-whitelist.md) · [`reports/combined-findings.md`](reports/combined-findings.md) · [`reports/venue-outage-ops-note-2026-11-16.md`](reports/venue-outage-ops-note-2026-11-16.md)
 
@@ -25,10 +25,13 @@ forge test --match-contract ForkBaseStockFrozen -vv
 Expected:
 
 ```
+[PASS] test_funded_pool133_end_to_end_swap_after_revival()   (1 USDC -> 0.0027987 AAPLc, $357.3)
 [PASS] test_funded_pool133_revives_when_pyth_feed_ts_refreshed()
 [PASS] test_slot1_ts_frozen_since_sept25_blocks_stock_pool()
-Suite result: ok. 2 passed; 0 failed
+Suite result: ok. 3 passed; 0 failed
 ```
+
+The swap test starts from live state, applies three surgical revivals (Pyth feed ts ×2, gate unpause, slot-80 ts/spread), then runs a real `pool.swap()` through a minimal callback swapper against the funded pool 133 (which holds 89.07 AAPLc + 9,578 USDC and is `paused` live) — proving the pipeline is complete and capital can move once feeds + unpause land on mainnet.
 
 Notes:
 - The tests fork Base via `https://base-rpc.publicnode.com` (`vm.createSelectFork`), read live state, and revive the broken paths with surgical `vm.store` patches — no mainnet txs.
